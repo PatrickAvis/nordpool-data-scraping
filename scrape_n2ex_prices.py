@@ -7,12 +7,15 @@ If the layout changes, update SELECTORS below.
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 import re
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -144,6 +147,155 @@ def rows_with_float_prices(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def first_period_start(period: Any) -> str:
+    if period is None:
+        return ""
+    m = re.search(r"(\d{2}:\d{2})", str(period))
+    return m.group(1) if m else str(period).strip()
+
+
+def rows_for_csv(rows: list[dict[str, Any]], delivery_date: str) -> list[dict[str, Any]]:
+    base_date = date.fromisoformat(delivery_date)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        period = first_period_start(row.get("period"))
+        row_date = base_date - timedelta(days=1) if period == "23:00" else base_date
+        out.append(
+            {
+                "deliverydate": row_date.isoformat(),
+                "start_t": period,
+                "price_gbp_mwh": row.get("price"),
+            }
+        )
+    return out
+
+
+def plus_30_minutes(period: str) -> str:
+    m = re.fullmatch(r"(\d{2}):(\d{2})", period.strip())
+    if not m:
+        return period
+    hours = int(m.group(1))
+    minutes = int(m.group(2))
+    total = (hours * 60 + minutes + 30) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def half_hourly_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        original = dict(row)
+        out.append(original)
+        shifted = dict(row)
+        shifted["start_t"] = plus_30_minutes(str(row.get("start_t", "")).strip())
+        out.append(shifted)
+    out.sort(key=lambda r: (str(r.get("deliverydate", "")), str(r.get("start_t", ""))))
+    return out
+
+
+def settlement_period_for_period(period: str) -> int | None:
+    m = re.fullmatch(r"(\d{2}):(\d{2})", period.strip())
+    if not m:
+        return None
+    hours = int(m.group(1))
+    minutes = int(m.group(2))
+    if minutes not in (0, 30):
+        return None
+    total_minutes = hours * 60 + minutes
+    return (total_minutes // 30) + 1
+
+
+def with_settlement_period(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+        r["settlement_period"] = settlement_period_for_period(str(r.get("start_t", "")))
+        out.append(r)
+    return out
+
+
+def with_london_datetime(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
+        london_tz = ZoneInfo("Europe/London")
+    except ZoneInfoNotFoundError as e:
+        raise SystemExit(
+            "Timezone data for Europe/London is not available. "
+            "Install dependency: .\\.venv\\Scripts\\python -m pip install tzdata"
+        ) from e
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+        delivery_date = str(r.get("deliverydate", "")).strip()
+        start_t = str(r.get("start_t", "")).strip()
+        m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})", delivery_date)
+        t = re.fullmatch(r"(\d{2}):(\d{2})", start_t)
+        if m and t:
+            d = date.fromisoformat(m.group(1))
+            dt = datetime(
+                d.year,
+                d.month,
+                d.day,
+                int(t.group(1)),
+                int(t.group(2)),
+                tzinfo=london_tz,
+            )
+            r["start_dt"] = dt.isoformat(timespec="minutes")
+        else:
+            r["start_dt"] = ""
+        out.append(r)
+    return out
+
+
+def output_fieldnames(half_hourly: bool) -> list[str]:
+    if half_hourly:
+        return ["start_dt", "deliverydate", "start_t", "settlement_period", "price_gbp_mwh"]
+    return ["start_dt", "deliverydate", "start_t", "price_gbp_mwh"]
+
+
+def pivot_grid(rows: list[dict[str, Any]]) -> tuple[list[int], list[list[Any]]]:
+    by_date: dict[str, dict[int, Any]] = defaultdict(dict)
+    periods: set[int] = set()
+
+    for row in rows:
+        d = str(row.get("deliverydate", "")).strip()
+        p = row.get("settlement_period")
+        v = row.get("price_gbp_mwh")
+        if not d or p is None:
+            continue
+        try:
+            p_int = int(p)
+        except (TypeError, ValueError):
+            continue
+        periods.add(p_int)
+        by_date[d][p_int] = v
+
+    ordered_periods = sorted(periods)
+    ordered_dates = sorted(by_date.keys())
+    matrix_rows: list[list[Any]] = []
+    for d in ordered_dates:
+        matrix_rows.append([d, *[by_date[d].get(p, "") for p in ordered_periods]])
+    return ordered_periods, matrix_rows
+
+
+def write_pivot_excel(rows: list[dict[str, Any]], output_path: str) -> None:
+    try:
+        from openpyxl import Workbook
+    except ImportError as e:
+        raise SystemExit(
+            "Excel export requires openpyxl. Install dependency: "
+            ".\\.venv\\Scripts\\python -m pip install openpyxl"
+        ) from e
+
+    settlement_periods, matrix_rows = pivot_grid(rows)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "prices_pivot"
+    ws.append(["deliverydate", *settlement_periods])
+    for row in matrix_rows:
+        ws.append(row)
+    wb.save(output_path)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=(
@@ -176,7 +328,20 @@ def main() -> None:
         default=_DEFAULT_PARAMS.delivery_areas,
         help=f"(default: {_DEFAULT_PARAMS.delivery_areas})",
     )
-    p.add_argument("--output", "-o", help="Write JSON to this file instead of stdout.")
+    p.add_argument("--output", "-o", help="Write CSV to this file instead of stdout.")
+    p.add_argument(
+        "--pivot-output",
+        help=(
+            "Optional .xlsx output path for pivoted data "
+            "(deliverydate rows, settlement_period columns, values=price_gbp_mwh). "
+            "Requires --half-hourly."
+        ),
+    )
+    p.add_argument(
+        "--half-hourly",
+        action="store_true",
+        help="Expand hourly rows into half-hourly rows (duplicate each row at +30 minutes).",
+    )
     p.add_argument("--headed", action="store_true", help="Show browser window (debug).")
     p.add_argument(
         "--use-edge",
@@ -199,11 +364,7 @@ def main() -> None:
         )
         portal_url = build_portal_url(params)
 
-    payload: dict[str, Any] = {
-        "url": portal_url,
-        "query": params.to_dict(),
-        "rows": [],
-    }
+    rows_with_prices: list[dict[str, Any]] = []
 
     with sync_playwright() as pw:
         launch_kwargs: dict[str, Any] = {"headless": not args.headed}
@@ -242,15 +403,31 @@ def main() -> None:
                 "inspect scrape_n2ex_prices.py (MUI DataGrid selectors)."
             ) from e
 
-        payload["rows"] = rows_with_float_prices(rows)
+        rows_with_prices = rows_with_float_prices(rows)
         browser.close()
 
-    text = json.dumps(payload, indent=2, ensure_ascii=False)
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
+    csv_rows = rows_for_csv(rows_with_prices, params.delivery_date)
+    fieldnames = output_fieldnames(half_hourly=False)
+    if args.half_hourly:
+        csv_rows = half_hourly_rows(csv_rows)
+        csv_rows = with_settlement_period(csv_rows)
+        fieldnames = output_fieldnames(half_hourly=True)
+    csv_rows = with_london_datetime(csv_rows)
+    output_target = args.output
+    if output_target:
+        with open(output_target, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(csv_rows)
     else:
-        sys.stdout.write(text + "\n")
+        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    if args.pivot_output:
+        if not args.half_hourly:
+            raise SystemExit("--pivot-output requires --half-hourly to include settlement_period values.")
+        write_pivot_excel(csv_rows, args.pivot_output)
 
 
 if __name__ == "__main__":

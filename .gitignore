@@ -24,3 +24,7 @@ playwright/.cache/
 
 .pytest_cache/
 .mypy_cache/
+
+# Generated scraper outputs
+prices*.csv
+prices*.xlsx

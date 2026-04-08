@@ -1,4 +1,6 @@
 playwright>=1.40.0
+tzdata
+openpyxl
 
 # Optional: playwright install chromium
 # On Windows you can skip that and run the scraper with --use-edge (system Microsoft Edge).
